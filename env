@@ -1,0 +1,244 @@
+#!/usr/bin/env -S bash -e
+
+export SRC_DIR="$(git rev-parse --show-toplevel)"
+REPO_NAME="$(basename "${SRC_DIR}")"
+
+mount_credentials="${BST_ENV_MOUNT_CREDENTIALS:-false}"
+mount_inputrc="${BST_ENV_MOUNT_INPUTRC:-false}"
+
+if [[  -e "${SRC_DIR}/.env" ]]; then
+  source "${SRC_DIR}/.env"
+fi
+
+host_src_dir="${BST_ENV_HOST_SRC:-"${SRC_DIR}"}"
+host_src_env_dir="${BST_ENV_HOST_SRC_ENV:-"${host_src_dir}/etc/env"}"
+host_src_cache_dir="${BST_ENV_HOST_SRC_VAR_CACHE:-"${host_src_dir}/var/cache"}"
+
+mount_home_readonly=()
+
+guest_home="/root"
+guest_src_dir="/src"
+
+bst_env_host_default_image="bstguy/env"
+bst_env_host_default_tex_image="bstguy/env-tex"
+
+builder_image="${BST_ENV_HOST_IMAGE:-"${bst_env_host_default_image}"}"
+
+declare -a docker_commands
+docker_commands=()
+if [[ -t 1 ]]; then
+  docker_commands+=(--interactive --tty)
+fi
+
+container_name="bstguy-env"
+
+declare -a docker_args
+docker_args=( \
+  --hostname "${container_name}"
+
+  # needed by gdb
+  --mount "type=bind,source=${host_src_dir},destination=${guest_src_dir},readonly"
+  --env TERM="${TERM:-xterm}"
+  --env SRC_DIR="${guest_src_dir}"
+)
+
+if [ -d "${host_src_env_dir}" ]; then
+  docker_args+=( \
+    --mount "type=bind,source=${host_src_env_dir},destination=/srv/etc,readonly"
+  )
+fi
+
+if [ -d "${host_src_cache_dir}" ]; then
+  docker_args+=( \
+  --mount "type=bind,source=${host_src_cache_dir},destination=/var/cache/bstguy"
+  )
+fi
+
+for what in "${BST_ENV_WRITABLE_DIRECTORIES[@]}"; do
+  docker_args+=( \
+    --mount "type=bind,source=${host_src_dir}/${what},destination=${guest_src_dir}/${what}"
+  )
+done
+
+container_id="$( \
+  docker ps --filter "name=${container_name}" \
+    | grep "${container_name}\$" \
+    | head -n 1 \
+    | awk '{print $1}' \
+)"
+start_new_builder=false
+attach_builder=false
+
+function print_help {
+  cat <<EOF
+usage:
+  $0 [flags...]
+
+flags:
+  -a | --attach:
+    attach to the existing container
+    default behavior is to start the container named \`${container_name}\`
+
+  -new:
+    force starting a new container under an auto-generated name
+
+  -image <image_name>:
+    use given image for the container (default: \`${bst_env_host_default_image}\`)
+
+  -tex:
+    use default image with TeX/LaTeX support (\`${bst_env_host_default_tex_image}\`)
+
+  -new:
+    force starting a new container under an auto-generated name
+
+  --mount-credentials | --dont-mount-credentials:
+    mount certain credential-related subdirectories from the host user's home directory, as readonly
+    namely: \`.gnupg\`, \`.ssh\`, \`.password-store\`
+
+  --mount-inputrc/--dont-mount-inputrc:
+
+  -h | --help:
+    print this help message
+
+variables:
+  set as either environment variables or in \`REPO_ROOT/.env\`
+
+  - BST_ENV_HOST_SRC [default: \`REPO_ROOT\`]:
+    source directory to be mounted as \`/src\`
+
+  - BST_ENV_HOST_SRC_ENV [default: \`\$BST_ENV_HOST_SRC/etc/env\`]:
+    directory to be mounted as \`/srv/etc\`
+
+  - BST_ENV_HOST_SRC_VAR_CACHE [default: \`\$BST_ENV_HOST_SRC/var/cache\`]:
+    directory to be used as cache, persisted across instantiations of the container, mounted as \`/var/cache/bstguy\`
+    most notably, \`bash_history\` is persisted under this directory to preserve bash history
+
+  - BST_ENV_HOST_IMAGE [default: \`bstguy/env\`]:
+    image to be used for the container
+
+  - BST_ENV_WRITABLE_DIRECTORIES [default: empty]:
+    array with paths relative to \`\$BST_ENV_HOST_SRC\` to be made writable to the container
+
+  - BST_ENV_MOUNT_CREDENTIALS [default: false]:
+    related to flags \`[dont-]mount-credentials\`
+    command line flags will override this setting
+
+  - BST_ENV_MOUNT_INPUTRC [default: false]:
+    related to flags \`[dont-]mount-inputrc\`
+    command line flags will override this setting
+EOF
+}
+
+while [[ "$#" -gt 0 ]]; do
+  arg="$1"; shift
+  case "${arg}" in
+    -h|--help)
+      print_help
+      exit
+      ;;
+
+    -a|--attach)
+      attach_builder=true
+      ;;
+
+    --new)
+      start_new_builder=true
+      ;;
+
+    --mount-credentials)
+      mount_credentials=true
+      ;;
+
+    --dont-mount-credentials)
+      mount_credentials=false
+      ;;
+
+    --mount-inputrc)
+      mount_inputrc=true
+      ;;
+
+    --dont-mount-inputrc)
+      mount_inputrc=false
+      ;;
+
+    --tex)
+      builder_image="${bst_env_host_default_tex_image}"
+      ;;
+
+    --)
+      break
+      ;;
+
+    *)
+      print_help
+      echo
+      echo "ERROR: unrecognized argument: ${arg}"
+      exit 1
+      ;;
+  esac
+done
+
+if [[ "${attach_builder}" == true ]]; then
+  [[ -n "${container_id}" ]] || (echo "ERROR: builder container not found"; exit 1)
+  set -x
+  exec docker exec "${docker_commands[@]}" "${container_id}" bash
+fi
+
+if [[ "${mount_credentials}" == true ]]; then
+  for name in .gnupg .ssh .password-store; do
+    [[ ! -e "${HOME}/${name}" ]] || mount_home_readonly+=("${name}")
+  done
+fi
+
+if [[ "${mount_inputrc}" == true ]]; then
+  for name in .inputrc; do
+    [[ ! -e "${HOME}/${name}" ]] || mount_home_readonly+=("${name}")
+  done
+fi
+
+for mount in "${mount_home_readonly[@]}"; do
+  docker_args+=( \
+    --mount "type=bind,source=${HOME}/${mount},destination=${guest_home}/${mount},readonly"
+  )
+done
+
+#############
+# var/cache #
+#############
+
+if [ -d "${host_src_cache_dir}" ]; then
+  mkdir -p "${host_src_cache_dir}"
+  [[ -e "${host_src_cache_dir}/bash_history" ]] || touch "${host_src_cache_dir}/bash_history"
+  docker_args+=(--volume "${host_src_cache_dir}/bash_history:${guest_home}/.bash_history")
+fi
+
+########################################################################
+
+if [[ "${start_new_builder}" == false ]]; then
+  if [[ -n "${container_id}" ]]; then
+    echo "ERROR: builder container already running with id ${container_id}"
+    exit 1
+  else
+    docker_args+=( \
+      --name "${container_name}"
+    )
+  fi
+fi
+
+builder_args=("$@"); shift "$#"
+
+entrypoint_args=()
+if [[ "${#builder_args[@]}" -gt 0 ]]; then
+  entrypoint_args+=(-c "env -S ${builder_args[*]}")
+fi
+
+echo -n "host system: "
+uname -a
+
+(set -x; \
+  exec docker run \
+    "${docker_commands[@]}" \
+    --rm "${docker_args[@]}" \
+    "${builder_image}" \
+    "${entrypoint_args[@]}" \
+)
